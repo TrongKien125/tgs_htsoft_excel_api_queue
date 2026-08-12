@@ -2,7 +2,7 @@
 /**
  * Plugin Name: TGS HTsoft Excel API Queue
  * Description: Nhận file XLS/XLSX qua REST API, xếp hàng và tự động nhập PNK/PBH/HTL bằng các plugin nghiệp vụ TGS.
- * Version: 1.6.2
+ * Version: 1.7.0
  * Author: TGS
  */
 
@@ -12,8 +12,8 @@ if (!defined('ABSPATH')) {
 
 final class TGS_HEIQ_Plugin
 {
-    const VERSION = '1.6.2';
-    const DB_VERSION = '1.2.0';
+    const VERSION = '1.7.0';
+    const DB_VERSION = '1.3.0';
     const DB_OPTION = 'tgs_heiq_db_version';
     const SETTINGS_OPTION = 'tgs_heiq_settings';
     const LEGACY_CRON_HOOK = 'tgs_heiq_process_queue';
@@ -39,11 +39,13 @@ final class TGS_HEIQ_Plugin
         require_once __DIR__ . '/includes/class-xlsx-reader.php';
         require_once __DIR__ . '/vendor/shuchkin/simplexls/src/SimpleXLS.php';
         require_once __DIR__ . '/includes/class-excel-reader.php';
+        require_once __DIR__ . '/includes/class-daily-log.php';
         require_once __DIR__ . '/includes/class-queue-processor.php';
 
         add_action('rest_api_init', array($this, 'register_rest_route'));
         add_action('init', array($this, 'maybe_install'));
         add_action('init', array($this, 'remove_legacy_schedule'), 1);
+        add_action('init', array('TGS_HEIQ_Daily_Log', 'recover_pending'), 30);
         add_action('admin_post_tgs_heiq_generate_key', array($this, 'generate_api_key'));
         add_action('admin_notices', array($this, 'dependency_notice'));
         add_filter('tgs_shop_workflow_nav', array($this, 'add_to_workflow_nav'), 10, 2);
@@ -123,6 +125,9 @@ final class TGS_HEIQ_Plugin
             duplicate_names longtext NULL,
             request_json longtext NULL,
             response_json longtext NULL,
+            log_archive_required tinyint(1) unsigned NOT NULL DEFAULT 0,
+            log_file_date date NULL,
+            log_archived_at datetime NULL,
             message text NULL,
             created_at datetime NOT NULL,
             started_at datetime NULL,
@@ -130,6 +135,8 @@ final class TGS_HEIQ_Plugin
             PRIMARY KEY  (id),
             UNIQUE KEY request_uuid (request_uuid),
             KEY status (status),
+            KEY log_archive_pending (log_archive_required, log_archived_at),
+            KEY log_file_date (log_file_date),
             KEY created_at (created_at)
         ) {$charset};");
 
@@ -236,6 +243,7 @@ final class TGS_HEIQ_Plugin
             'request_uuid' => $uuid,
             'status' => 'receiving',
             'request_json' => wp_json_encode($request_log, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+            'log_archive_required' => 1,
             'created_at' => $now,
         ));
         $request_id = intval($wpdb->insert_id);
@@ -264,6 +272,7 @@ final class TGS_HEIQ_Plugin
                 'response_json' => wp_json_encode($response_log, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
                 'completed_at' => current_time('mysql'),
             ), array('id' => $request_id));
+            TGS_HEIQ_Daily_Log::archive_request($request_id);
             return new WP_Error(
                 $authorization->get_error_code(),
                 $message,
@@ -403,6 +412,7 @@ final class TGS_HEIQ_Plugin
                 'body' => $response_log,
             ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
         ), array('id' => $request_id));
+        TGS_HEIQ_Daily_Log::archive_request($request_id);
         return new WP_REST_Response($response_log, 200);
     }
 
@@ -644,15 +654,20 @@ final class TGS_HEIQ_Plugin
         if (!current_user_can('manage_options')) {
             return;
         }
-        global $wpdb;
         $settings = self::settings();
         $new_key = get_transient('tgs_heiq_new_key_' . get_current_user_id());
         if ($new_key) {
             delete_transient('tgs_heiq_new_key_' . get_current_user_id());
         }
-        $requests = $wpdb->get_results('SELECT * FROM ' . self::request_table() . ' ORDER BY id DESC LIMIT 50', ARRAY_A);
-        $files = $wpdb->get_results('SELECT * FROM ' . self::file_table() . ' ORDER BY id DESC LIMIT 100', ARRAY_A);
-        $voucher_logs = $wpdb->get_results('SELECT * FROM ' . self::voucher_log_table() . ' ORDER BY id DESC LIMIT 300', ARRAY_A);
+        TGS_HEIQ_Daily_Log::recover_pending();
+        $selected_log_date = TGS_HEIQ_Daily_Log::selected_date(
+            isset($_GET['heiq_log_date']) ? sanitize_text_field(wp_unslash($_GET['heiq_log_date'])) : ''
+        );
+        $daily_log = TGS_HEIQ_Daily_Log::read_date($selected_log_date);
+        $requests = array_slice($daily_log['requests'], 0, 50);
+        $files = array_slice($daily_log['files'], 0, 100);
+        $voucher_logs = array_slice($daily_log['vouchers'], 0, 300);
+        $log_error = TGS_HEIQ_Daily_Log::last_error();
         $endpoint = rest_url(self::REST_NAMESPACE . self::REST_ROUTE);
         $test_endpoint = rest_url(self::REST_NAMESPACE . self::REST_ADMIN_SUBMIT_ROUTE);
         $test_nonce = wp_create_nonce('wp_rest');
@@ -669,7 +684,7 @@ final class TGS_HEIQ_Plugin
             .tgs-heiq-page{--heiq-blue:#175cd3;--heiq-border:#e4e7ec;--heiq-text:#101828;--heiq-muted:#667085;color:var(--heiq-text);padding:4px 10px 32px;max-width:100%}
             .tgs-heiq-page *{box-sizing:border-box}.heiq-hero{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin:8px 0 22px}
             .heiq-hero h1{font-size:26px;line-height:1.25;margin:0 0 7px;color:var(--heiq-text)}.heiq-hero p{margin:0;color:var(--heiq-muted);font-size:14px}
-            .heiq-live{display:inline-flex;align-items:center;gap:7px;padding:7px 12px;border-radius:999px;background:#ecfdf3;color:#027a48;font-weight:600;white-space:nowrap}.heiq-live:before{content:"";width:8px;height:8px;border-radius:50%;background:#12b76a}
+            .heiq-hero-actions{display:flex;align-items:center;gap:10px;flex-wrap:wrap;justify-content:flex-end}.heiq-live{display:inline-flex;align-items:center;gap:7px;padding:7px 12px;border-radius:999px;background:#ecfdf3;color:#027a48;font-weight:600;white-space:nowrap}.heiq-live:before{content:"";width:8px;height:8px;border-radius:50%;background:#12b76a}.heiq-date-form{display:flex;align-items:center;gap:7px}.heiq-date-form label{font-weight:600;color:#344054;white-space:nowrap}.heiq-date-form input{height:36px;border:1px solid #d0d5dd;border-radius:8px;padding:0 9px;background:#fff}.heiq-log-warning{display:flex;gap:9px;align-items:flex-start;margin:0 0 18px;padding:12px 14px;border:1px solid #fec84b;border-radius:9px;background:#fffaeb;color:#93370d}
             .heiq-grid{display:grid;grid-template-columns:minmax(0,1.35fr) minmax(330px,.65fr);gap:18px;margin-bottom:18px}.heiq-card{background:#fff;border:1px solid var(--heiq-border);border-radius:12px;padding:20px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
             .heiq-card h2{font-size:17px;margin:0 0 5px}.heiq-card-description{color:var(--heiq-muted);margin:0 0 16px;font-size:13px}.heiq-field-label{display:block;font-weight:600;margin-bottom:7px}
             .heiq-copy-row{display:flex;gap:8px;align-items:stretch}.heiq-copy-row input{min-width:0;flex:1;height:40px;border:1px solid #d0d5dd;border-radius:8px;background:#f9fafb;padding:0 12px;color:#344054;font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.heiq-copy-row .button{height:40px;display:inline-flex;align-items:center;gap:6px;border-radius:8px;padding:0 14px;white-space:nowrap}
@@ -683,13 +698,26 @@ final class TGS_HEIQ_Plugin
             .heiq-request-table{min-width:1280px}.heiq-json-button{display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border:1px solid #d0d5dd;border-radius:6px;background:#fff;color:#344054;font-size:12px;line-height:1.2;cursor:pointer;white-space:nowrap}.heiq-json-button:hover,.heiq-json-button:focus{border-color:#84adff;background:#eff4ff;color:var(--heiq-blue)}.heiq-json-empty{color:#98a2b3}.heiq-json-modal-body{max-height:min(65vh,650px);overflow:auto;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55;color:#344054;background:#101828;border-radius:8px;padding:16px;color:#e4e7ec;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
             .heiq-badge{display:inline-flex;padding:3px 9px;border-radius:999px;background:#f2f4f7;color:#344054;font-size:12px;font-weight:600;white-space:nowrap}.heiq-badge-completed,.heiq-badge-imported{background:#ecfdf3;color:#027a48}.heiq-badge-failed{background:#fef3f2;color:#b42318}.heiq-badge-processing,.heiq-badge-queued,.heiq-badge-receiving{background:#eff8ff;color:#175cd3}.heiq-badge-partial,.heiq-badge-skipped{background:#fffaeb;color:#b54708}.heiq-badge-duplicate{background:#f4f3ff;color:#5925dc}
             .heiq-copy-feedback{min-height:18px;color:#027a48;font-size:12px;margin-top:5px}
-            @media(max-width:1000px){.heiq-grid{grid-template-columns:1fr}.heiq-facts{grid-template-columns:1fr}.heiq-test-form{grid-template-columns:1fr}.heiq-test-button{justify-self:start}.heiq-hero{flex-direction:column}.heiq-copy-row{flex-wrap:wrap}.heiq-copy-row input{flex-basis:100%}.heiq-table-heading{align-items:flex-start}.heiq-table-actions{align-items:flex-end;flex-direction:column;gap:6px}}
+            @media(max-width:1000px){.heiq-grid{grid-template-columns:1fr}.heiq-facts{grid-template-columns:1fr}.heiq-test-form{grid-template-columns:1fr}.heiq-test-button{justify-self:start}.heiq-hero{flex-direction:column}.heiq-hero-actions{justify-content:flex-start}.heiq-copy-row{flex-wrap:wrap}.heiq-copy-row input{flex-basis:100%}.heiq-table-heading{align-items:flex-start}.heiq-table-actions{align-items:flex-end;flex-direction:column;gap:6px}}
         </style>
         <div class="tgs-heiq-page">
             <header class="heiq-hero">
                 <div><h1>Nhập Excel tự động qua API</h1><p>Tiếp nhận, xếp hàng và theo dõi các file HTsoft được gửi từ BTauto.</p></div>
-                <span class="heiq-live">API đang hoạt động</span>
+                <div class="heiq-hero-actions">
+                    <form class="heiq-date-form" method="get" action="<?php echo esc_url(admin_url('admin.php')); ?>">
+                        <input type="hidden" name="page" value="tgs-shop-management">
+                        <input type="hidden" name="view" value="<?php echo esc_attr(self::DASHBOARD_VIEW); ?>">
+                        <label for="heiq-log-date">Ngày log</label>
+                        <input id="heiq-log-date" name="heiq_log_date" type="date" min="<?php echo esc_attr(TGS_HEIQ_Daily_Log::minimum_date()); ?>" max="<?php echo esc_attr(TGS_HEIQ_Daily_Log::maximum_date()); ?>" value="<?php echo esc_attr($selected_log_date); ?>" onchange="this.form.submit()">
+                        <noscript><button type="submit" class="button">Xem</button></noscript>
+                    </form>
+                    <span class="heiq-live">API đang hoạt động</span>
+                </div>
             </header>
+
+            <?php if (!empty($log_error['message'])) : ?>
+                <div class="heiq-log-warning"><i class="bx bx-error-circle"></i><div><strong>Chưa ghi được file log.</strong> <?php echo esc_html($log_error['message']); ?><?php if (!empty($log_error['created_at'])) : ?> <small>(<?php echo esc_html($log_error['created_at']); ?>)</small><?php endif; ?> Dữ liệu chi tiết vẫn được giữ trong bảng chờ và hệ thống sẽ tự thử lại.</div></div>
+            <?php endif; ?>
 
             <div class="heiq-grid">
                 <section class="heiq-card">
@@ -730,25 +758,25 @@ final class TGS_HEIQ_Plugin
                 <div id="heiq-test-result" class="heiq-test-result" aria-live="polite"><div id="heiq-test-result-title" class="heiq-test-result-title"></div><div id="heiq-test-result-details" class="heiq-test-details"></div></div>
             </section>
 
-            <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><h2>Request gần nhất</h2><div class="heiq-table-actions"><span>Tối đa 50 request</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-request-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-request-scroll" class="heiq-table-scroll" data-visible-rows="10">
+            <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><h2>Request trong ngày <?php echo esc_html(date_i18n('d/m/Y', strtotime($selected_log_date))); ?></h2><div class="heiq-table-actions"><span>Tối đa 50 request</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-request-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-request-scroll" class="heiq-table-scroll" data-visible-rows="10">
                 <table class="widefat striped heiq-request-table"><thead><tr><th>ID</th><th>Request ID</th><th>Trạng thái</th><th>Tổng</th><th>Nhận</th><th>Trùng</th><th>Lỗi</th><th>Thời gian</th><th>Request</th><th>Response</th><th>Thông báo</th></tr></thead><tbody>
-                <?php if (!$requests) : ?><tr><td class="heiq-empty" colspan="11">Chưa có request nào.</td></tr><?php endif; ?>
+                <?php if (!$requests) : ?><tr><td class="heiq-empty" colspan="11">Không có request trong file log của ngày đã chọn.</td></tr><?php endif; ?>
                 <?php foreach ($requests as $row) : $status = (string) $row['status']; ?>
                     <tr><td><?php echo intval($row['id']); ?></td><td><code><?php echo esc_html($row['request_uuid']); ?></code></td><td><span class="heiq-badge heiq-badge-<?php echo esc_attr(sanitize_html_class($status)); ?>"><?php echo esc_html(isset($status_labels[$status]) ? $status_labels[$status] : $status); ?></span></td><td><?php echo intval($row['total_files']); ?></td><td><?php echo intval($row['accepted_files']); ?></td><td><?php echo intval($row['duplicate_files']); ?></td><td><?php echo intval($row['failed_files']); ?></td><td><?php echo esc_html($row['created_at']); ?></td><td><?php if (!empty($row['request_json'])) : ?><button type="button" class="heiq-json-button" data-json="<?php echo esc_attr($row['request_json']); ?>" data-json-title="Request — <?php echo esc_attr($row['request_uuid']); ?>"><i class="bx bx-upload"></i> Xem</button><?php else : ?><span class="heiq-json-empty">—</span><?php endif; ?></td><td><?php if (!empty($row['response_json'])) : ?><button type="button" class="heiq-json-button" data-json="<?php echo esc_attr($row['response_json']); ?>" data-json-title="Response — <?php echo esc_attr($row['request_uuid']); ?>"><i class="bx bx-download"></i> Xem</button><?php else : ?><span class="heiq-json-empty">—</span><?php endif; ?></td><td><?php echo esc_html($row['message']); ?></td></tr>
                 <?php endforeach; ?></tbody></table>
             </div></section>
 
-            <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><h2>File gần nhất</h2><div class="heiq-table-actions"><span>Tối đa 100 file</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-file-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-file-scroll" class="heiq-table-scroll" data-visible-rows="10">
+            <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><h2>File trong ngày</h2><div class="heiq-table-actions"><span>Tối đa 100 file</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-file-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-file-scroll" class="heiq-table-scroll" data-visible-rows="10">
                 <table class="widefat striped heiq-files-table"><thead><tr><th style="width:58px">ID</th><th style="width:72px">Request</th><th style="width:190px">File</th><th style="width:90px">Loại</th><th style="width:96px">Trạng thái</th><th style="width:78px">Sheet</th><th style="width:58px">Phiếu</th><th style="width:70px">Đã nhập</th><th style="width:58px">Trùng</th><th class="heiq-error-column">Lỗi</th><th style="width:130px">Hoàn tất</th></tr></thead><tbody>
-                <?php if (!$files) : ?><tr><td class="heiq-empty" colspan="11">Chưa có file nào.</td></tr><?php endif; ?>
+                <?php if (!$files) : ?><tr><td class="heiq-empty" colspan="11">Không có file trong log của ngày đã chọn.</td></tr><?php endif; ?>
                 <?php foreach ($files as $row) : $status = (string) $row['status']; $kind = (string) $row['kind']; $last_error = trim((string) $row['last_error']); $error_is_long = mb_strlen($last_error) > 90; $error_preview = $error_is_long ? mb_substr($last_error, 0, 90) : $last_error; ?>
                     <tr><td><?php echo intval($row['id']); ?></td><td><?php echo intval($row['request_id']); ?></td><td class="heiq-file-name"><strong><?php echo esc_html($row['file_name']); ?></strong></td><td><?php echo esc_html(isset($kind_labels[$kind]) ? $kind_labels[$kind] : $kind); ?></td><td><span class="heiq-badge heiq-badge-<?php echo esc_attr(sanitize_html_class($status)); ?>"><?php echo esc_html(isset($status_labels[$status]) ? $status_labels[$status] : $status); ?></span></td><td><?php echo esc_html($row['sheet_name']); ?></td><td><?php echo intval($row['vouchers_total']); ?></td><td><?php echo intval($row['vouchers_imported']); ?></td><td><?php echo intval($row['vouchers_duplicate']); ?></td><td class="heiq-error-column"><?php if ($last_error !== '') : ?><div class="heiq-error-preview"><span class="heiq-error-text"><?php echo esc_html($error_preview); ?></span><?php if ($error_is_long) : ?><button type="button" class="heiq-error-more" data-error="<?php echo esc_attr($last_error); ?>" data-file="<?php echo esc_attr($row['file_name']); ?>" aria-label="Xem đầy đủ lỗi của <?php echo esc_attr($row['file_name']); ?>" title="Xem chi tiết lỗi">…</button><?php endif; ?></div><?php else : ?><span class="heiq-error-empty">—</span><?php endif; ?></td><td><?php echo esc_html($row['completed_at']); ?></td></tr>
                 <?php endforeach; ?></tbody></table>
             </div></section>
 
-            <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><div><h2>Nhật ký phiếu</h2><span>Chi tiết từng phiếu đã nhập, bị trùng, bị bỏ qua hoặc xử lý lỗi.</span></div><div class="heiq-table-actions"><span>Tối đa 300 dòng</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-voucher-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-voucher-scroll" class="heiq-table-scroll" data-visible-rows="10">
+            <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><div><h2>Nhật ký phiếu trong ngày</h2><span>Chi tiết từng phiếu đã nhập, bị trùng, bị bỏ qua hoặc xử lý lỗi.</span></div><div class="heiq-table-actions"><span>Tối đa 300 dòng</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-voucher-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-voucher-scroll" class="heiq-table-scroll" data-visible-rows="10">
                 <table class="widefat striped"><thead><tr><th>ID</th><th>Thời gian</th><th>File</th><th>Mã phiếu</th><th>Kho</th><th>Nghiệp vụ</th><th>Trạng thái</th><th>Lý do / kết quả</th></tr></thead><tbody>
-                <?php if (!$voucher_logs) : ?><tr><td class="heiq-empty" colspan="8">Chưa có nhật ký phiếu. Chi tiết sẽ được ghi cho các file xử lý từ phiên bản 1.4.0.</td></tr><?php endif; ?>
+                <?php if (!$voucher_logs) : ?><tr><td class="heiq-empty" colspan="8">Không có nhật ký phiếu trong ngày đã chọn.</td></tr><?php endif; ?>
                 <?php foreach ($voucher_logs as $row) : $status = (string) $row['status']; $kind = (string) $row['kind']; ?>
                     <tr><td><?php echo intval($row['id']); ?></td><td><?php echo esc_html($row['created_at']); ?></td><td><strong><?php echo esc_html($row['file_name']); ?></strong></td><td><code><?php echo esc_html($row['voucher_code'] !== '' ? $row['voucher_code'] : '(không xác định)'); ?></code></td><td><?php echo esc_html($row['site_code']); ?></td><td><?php echo esc_html(isset($kind_labels[$kind]) ? $kind_labels[$kind] : $kind); ?></td><td><span class="heiq-badge heiq-badge-<?php echo esc_attr(sanitize_html_class($status)); ?>"><?php echo esc_html(isset($status_labels[$status]) ? $status_labels[$status] : $status); ?></span></td><td><?php echo esc_html($row['message']); ?></td></tr>
                 <?php endforeach; ?></tbody></table>
