@@ -170,9 +170,8 @@ class TGS_HEIQ_Queue_Processor
         }
         foreach ($candidates['unmapped'] as $candidate) {
             $result['skipped']++;
-            $result['failed']++;
             $message = 'Kho chưa được ánh xạ tới website.';
-            $result['errors'][] = $candidate['voucher_code'] . ': ' . $message . ' (' . $candidate['site_code'] . ')';
+            $result['warnings'][] = $candidate['voucher_code'] . ': ' . $message . ' (' . $candidate['site_code'] . ')';
             self::log_voucher($file, $candidate['voucher_code'], $candidate['site_code'], 'skipped', $message);
         }
 
@@ -220,9 +219,8 @@ class TGS_HEIQ_Queue_Processor
             }
             if (!empty($voucher['missing_skus'])) {
                 $result['skipped']++;
-                $result['failed']++;
                 $message = 'Thiếu SKU ' . implode(', ', $voucher['missing_skus']);
-                $result['errors'][] = $voucher['voucher_code'] . ': ' . $message;
+                $result['warnings'][] = $voucher['voucher_code'] . ': ' . $message;
                 self::log_voucher($file, $voucher['voucher_code'], $voucher['site_code'], 'skipped', $message);
                 continue;
             }
@@ -251,23 +249,22 @@ class TGS_HEIQ_Queue_Processor
         if (!empty($parsed['skipped']['no_warehouse'])) {
             foreach ($no_warehouse_candidates as $candidate) {
                 $result['skipped']++;
-                $result['failed']++;
                 $message = sprintf('Kho %s chưa được ánh xạ tới website.', $candidate['site_code']);
-                $result['errors'][] = $candidate['voucher_code'] . ': ' . $message;
+                $result['warnings'][] = $candidate['voucher_code'] . ': ' . $message;
                 self::log_voucher($file, $candidate['voucher_code'], $candidate['site_code'], 'skipped', $message);
             }
             // Dự phòng file có cấu trúc tiêu đề mới mà bộ dò chi tiết chưa nhận ra.
             if (!$no_warehouse_candidates) {
                 foreach ($parsed['skipped']['no_warehouse'] as $warehouse => $count) {
                     $result['skipped']++;
-                    $result['failed']++;
+                    $result['total']++;
                     $message = sprintf('Kho chưa ánh xạ (%d dòng); không xác định được mã phiếu.', $count);
-                    $result['errors'][] = sprintf('Kho chưa ánh xạ: %s (%d dòng)', $warehouse, $count);
+                    $result['warnings'][] = sprintf('Kho chưa ánh xạ: %s (%d dòng)', $warehouse, $count);
                     self::log_voucher($file, '', $warehouse, 'skipped', $message);
                 }
             }
         }
-        if ($result['total'] === 0 && !$result['errors']) {
+        if ($result['total'] === 0 && $result['skipped'] === 0) {
             throw new Exception('Sheet đầu tiên không có phiếu phù hợp với loại file.');
         }
         return self::finalize_result($result);
@@ -487,12 +484,16 @@ class TGS_HEIQ_Queue_Processor
             'duplicate' => 0,
             'skipped' => 0,
             'failed' => 0,
+            'warnings' => array(),
             'errors' => array(),
         );
     }
 
     private static function finalize_result(array $result)
     {
+        // Bỏ qua là kết quả xử lý hợp lệ (ví dụ thiếu ánh xạ/SKU) và đã được
+        // ghi rõ ở voucher log. Chỉ lỗi thực sự khi tạo phiếu mới làm file
+        // partial/failed, để BTauto nhận completed và không gửi lại file đã xử lý.
         if ($result['failed'] > 0) {
             $result['status'] = ($result['imported'] > 0 || $result['duplicate'] > 0) ? 'partial' : 'failed';
         }

@@ -2,7 +2,7 @@
 /**
  * Plugin Name: TGS HTsoft Excel API Queue
  * Description: Nhận file XLS/XLSX qua REST API, xếp hàng và tự động nhập PNK/PBH/HTL bằng các plugin nghiệp vụ TGS.
- * Version: 1.6.0
+ * Version: 1.6.2
  * Author: TGS
  */
 
@@ -12,8 +12,8 @@ if (!defined('ABSPATH')) {
 
 final class TGS_HEIQ_Plugin
 {
-    const VERSION = '1.6.0';
-    const DB_VERSION = '1.1.0';
+    const VERSION = '1.6.2';
+    const DB_VERSION = '1.2.0';
     const DB_OPTION = 'tgs_heiq_db_version';
     const SETTINGS_OPTION = 'tgs_heiq_settings';
     const LEGACY_CRON_HOOK = 'tgs_heiq_process_queue';
@@ -121,6 +121,8 @@ final class TGS_HEIQ_Plugin
             completed_files int(10) unsigned NOT NULL DEFAULT 0,
             failed_files int(10) unsigned NOT NULL DEFAULT 0,
             duplicate_names longtext NULL,
+            request_json longtext NULL,
+            response_json longtext NULL,
             message text NULL,
             created_at datetime NOT NULL,
             started_at datetime NULL,
@@ -228,9 +230,12 @@ final class TGS_HEIQ_Plugin
         global $wpdb;
         $uuid = wp_generate_uuid4();
         $now = current_time('mysql');
+        $files = $this->normalize_uploaded_files($request->get_file_params());
+        $request_log = $this->build_request_log($request, $files);
         $wpdb->insert(self::request_table(), array(
             'request_uuid' => $uuid,
             'status' => 'receiving',
+            'request_json' => wp_json_encode($request_log, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
             'created_at' => $now,
         ));
         $request_id = intval($wpdb->insert_id);
@@ -241,15 +246,24 @@ final class TGS_HEIQ_Plugin
         $authorization = $this->authorize_request($request);
         if (is_wp_error($authorization)) {
             $message = $authorization->get_error_message();
+            $data = $authorization->get_error_data();
+            $data = is_array($data) ? $data : array();
+            $data['request_id'] = $uuid;
+            $response_log = array(
+                'http_status' => intval($data['status'] ?? 500),
+                'body' => array(
+                    'code' => $authorization->get_error_code(),
+                    'message' => $message,
+                    'data' => $data,
+                ),
+            );
             $wpdb->update(self::request_table(), array(
                 'status' => 'failed',
                 'failed_files' => 1,
                 'message' => $message,
+                'response_json' => wp_json_encode($response_log, JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
                 'completed_at' => current_time('mysql'),
             ), array('id' => $request_id));
-            $data = $authorization->get_error_data();
-            $data = is_array($data) ? $data : array();
-            $data['request_id'] = $uuid;
             return new WP_Error(
                 $authorization->get_error_code(),
                 $message,
@@ -257,7 +271,6 @@ final class TGS_HEIQ_Plugin
             );
         }
 
-        $files = $this->normalize_uploaded_files($request->get_file_params());
         $total = count($files);
         $accepted = 0;
         $duplicates = array();
@@ -374,11 +387,51 @@ final class TGS_HEIQ_Plugin
             }
         }
 
-        return new WP_REST_Response(array(
+        $success = !in_array($status, array('failed', 'partial'), true);
+        $response_log = array(
+            'success' => $success,
             'accepted' => $accepted > 0,
             'request_id' => $uuid,
             'status' => $status,
-        ), 200);
+            'message' => $success
+                ? 'File đã được tiếp nhận hoặc xử lý; BTauto không cần gửi lại.'
+                : 'File có lỗi thực sự; kiểm tra nhật ký import.',
+        );
+        $wpdb->update(self::request_table(), array(
+            'response_json' => wp_json_encode(array(
+                'http_status' => 200,
+                'body' => $response_log,
+            ), JSON_UNESCAPED_UNICODE | JSON_UNESCAPED_SLASHES),
+        ), array('id' => $request_id));
+        return new WP_REST_Response($response_log, 200);
+    }
+
+    /**
+     * Log request phục vụ đối soát nhưng tuyệt đối không lưu API key hoặc nội
+     * dung nhị phân của file Excel.
+     */
+    private function build_request_log(WP_REST_Request $request, array $files)
+    {
+        $file_logs = array();
+        foreach ($files as $file) {
+            $file_logs[] = array(
+                'name' => sanitize_file_name(wp_basename((string) ($file['name'] ?? ''))),
+                'type' => sanitize_text_field((string) ($file['type'] ?? '')),
+                'size' => intval($file['size'] ?? 0),
+                'upload_error' => intval($file['error'] ?? 0),
+            );
+        }
+
+        return array(
+            'method' => $request->get_method(),
+            'route' => $request->get_route(),
+            'received_at' => current_time('mysql'),
+            'remote_ip' => sanitize_text_field((string) ($_SERVER['REMOTE_ADDR'] ?? '')),
+            'user_agent' => sanitize_text_field((string) $request->get_header('user-agent')),
+            'content_type' => sanitize_text_field((string) $request->get_header('content-type')),
+            'has_api_key' => trim((string) $request->get_header('x-api-key')) !== '',
+            'files' => $file_logs,
+        );
     }
 
     public function authorize_admin_submit()
@@ -627,6 +680,7 @@ final class TGS_HEIQ_Plugin
             .heiq-test-card{margin-bottom:18px}.heiq-test-head{display:flex;justify-content:space-between;align-items:flex-start;gap:18px;margin-bottom:16px}.heiq-real-run{display:inline-flex;padding:5px 9px;border-radius:6px;background:#fff4ed;color:#b93815;font-size:12px;font-weight:700;white-space:nowrap}.heiq-test-form{display:grid;grid-template-columns:minmax(260px,.8fr) minmax(320px,1.2fr) auto;gap:14px;align-items:end}.heiq-test-field label{display:block;font-weight:600;margin-bottom:7px}.heiq-test-field input[type=file]{width:100%;height:40px;border:1px solid #d0d5dd;border-radius:8px;background:#fff;padding:6px 10px}.heiq-auto-key{height:40px;display:flex;align-items:center;gap:8px;border:1px solid #d0d5dd;border-radius:8px;background:#f9fafb;padding:0 12px;color:#344054}.heiq-auto-key.is-ready i{color:#12b76a}.heiq-auto-key.is-missing{color:#b42318;background:#fef3f2;border-color:#fecdca}.heiq-test-button{height:40px!important;border-radius:8px!important;display:inline-flex!important;align-items:center;gap:6px}.heiq-test-help{color:#b54708;font-size:12px;margin:9px 0 0}.heiq-test-result{display:none;margin-top:15px;padding:13px 15px;border-radius:9px;border:1px solid}.heiq-test-result.is-success{display:block;background:#ecfdf3;border-color:#abefc6;color:#05603a}.heiq-test-result.is-error{display:block;background:#fef3f2;border-color:#fecdca;color:#b42318}.heiq-test-result-title{font-weight:700;margin-bottom:7px}.heiq-test-details{display:flex;flex-wrap:wrap;gap:7px 18px;font-size:13px}.heiq-test-details span{white-space:nowrap}
             .heiq-table-card{padding:0;margin-bottom:18px;overflow:hidden}.heiq-table-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:17px 20px;border-bottom:1px solid var(--heiq-border)}.heiq-table-heading h2{margin:0}.heiq-table-heading span{color:var(--heiq-muted);font-size:13px}.heiq-table-actions{display:flex;align-items:center;gap:12px}.heiq-row-limit-label{display:flex;align-items:center;gap:7px;margin:0;color:var(--heiq-muted);font-size:13px;white-space:nowrap}.heiq-row-limit{min-width:72px;height:34px;padding:2px 28px 2px 9px;border:1px solid #d0d5dd;border-radius:7px;background-color:#fff;color:#344054}.heiq-table-scroll{overflow:auto;padding:0 0 4px;transition:max-height .18s ease}.heiq-table-scroll[data-visible-rows="10"]{max-height:620px}.heiq-table-scroll thead tr:first-child th{position:sticky;top:0;z-index:3;background:#fff}.tgs-heiq-page table.widefat{border:0;box-shadow:none}.tgs-heiq-page table.widefat th{font-weight:600;color:#344054}.tgs-heiq-page table.widefat td,.tgs-heiq-page table.widefat th{vertical-align:middle}.heiq-empty{text-align:center!important;color:var(--heiq-muted)!important;padding:28px!important}
             .heiq-files-table{table-layout:fixed;min-width:1120px}.heiq-files-table .heiq-file-name{overflow-wrap:anywhere}.heiq-files-table .heiq-error-column{width:280px!important;max-width:280px}.heiq-error-preview{display:flex;align-items:center;min-width:0;gap:5px}.heiq-error-text{display:block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#475467}.heiq-error-more{flex:0 0 auto;min-width:30px;padding:0 7px;border:0;background:#eff4ff;color:var(--heiq-blue);border-radius:5px;font-weight:700;line-height:24px;cursor:pointer}.heiq-error-more:hover,.heiq-error-more:focus{background:#dbe8ff;color:#004eae;outline:2px solid transparent}.heiq-error-empty{color:#98a2b3}.heiq-error-modal-body{max-height:min(62vh,620px);overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6;color:#344054;background:#f8fafc;border:1px solid var(--heiq-border);border-radius:8px;padding:14px}
+            .heiq-request-table{min-width:1280px}.heiq-json-button{display:inline-flex;align-items:center;gap:5px;padding:5px 9px;border:1px solid #d0d5dd;border-radius:6px;background:#fff;color:#344054;font-size:12px;line-height:1.2;cursor:pointer;white-space:nowrap}.heiq-json-button:hover,.heiq-json-button:focus{border-color:#84adff;background:#eff4ff;color:var(--heiq-blue)}.heiq-json-empty{color:#98a2b3}.heiq-json-modal-body{max-height:min(65vh,650px);overflow:auto;margin:0;white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.55;color:#344054;background:#101828;border-radius:8px;padding:16px;color:#e4e7ec;font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace}
             .heiq-badge{display:inline-flex;padding:3px 9px;border-radius:999px;background:#f2f4f7;color:#344054;font-size:12px;font-weight:600;white-space:nowrap}.heiq-badge-completed,.heiq-badge-imported{background:#ecfdf3;color:#027a48}.heiq-badge-failed{background:#fef3f2;color:#b42318}.heiq-badge-processing,.heiq-badge-queued,.heiq-badge-receiving{background:#eff8ff;color:#175cd3}.heiq-badge-partial,.heiq-badge-skipped{background:#fffaeb;color:#b54708}.heiq-badge-duplicate{background:#f4f3ff;color:#5925dc}
             .heiq-copy-feedback{min-height:18px;color:#027a48;font-size:12px;margin-top:5px}
             @media(max-width:1000px){.heiq-grid{grid-template-columns:1fr}.heiq-facts{grid-template-columns:1fr}.heiq-test-form{grid-template-columns:1fr}.heiq-test-button{justify-self:start}.heiq-hero{flex-direction:column}.heiq-copy-row{flex-wrap:wrap}.heiq-copy-row input{flex-basis:100%}.heiq-table-heading{align-items:flex-start}.heiq-table-actions{align-items:flex-end;flex-direction:column;gap:6px}}
@@ -677,10 +731,10 @@ final class TGS_HEIQ_Plugin
             </section>
 
             <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><h2>Request gần nhất</h2><div class="heiq-table-actions"><span>Tối đa 50 request</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-request-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-request-scroll" class="heiq-table-scroll" data-visible-rows="10">
-                <table class="widefat striped"><thead><tr><th>ID</th><th>Request</th><th>Trạng thái</th><th>Tổng</th><th>Nhận</th><th>Trùng</th><th>Lỗi</th><th>Thời gian</th><th>Thông báo</th></tr></thead><tbody>
-                <?php if (!$requests) : ?><tr><td class="heiq-empty" colspan="9">Chưa có request nào.</td></tr><?php endif; ?>
+                <table class="widefat striped heiq-request-table"><thead><tr><th>ID</th><th>Request ID</th><th>Trạng thái</th><th>Tổng</th><th>Nhận</th><th>Trùng</th><th>Lỗi</th><th>Thời gian</th><th>Request</th><th>Response</th><th>Thông báo</th></tr></thead><tbody>
+                <?php if (!$requests) : ?><tr><td class="heiq-empty" colspan="11">Chưa có request nào.</td></tr><?php endif; ?>
                 <?php foreach ($requests as $row) : $status = (string) $row['status']; ?>
-                    <tr><td><?php echo intval($row['id']); ?></td><td><code><?php echo esc_html($row['request_uuid']); ?></code></td><td><span class="heiq-badge heiq-badge-<?php echo esc_attr(sanitize_html_class($status)); ?>"><?php echo esc_html(isset($status_labels[$status]) ? $status_labels[$status] : $status); ?></span></td><td><?php echo intval($row['total_files']); ?></td><td><?php echo intval($row['accepted_files']); ?></td><td><?php echo intval($row['duplicate_files']); ?></td><td><?php echo intval($row['failed_files']); ?></td><td><?php echo esc_html($row['created_at']); ?></td><td><?php echo esc_html($row['message']); ?></td></tr>
+                    <tr><td><?php echo intval($row['id']); ?></td><td><code><?php echo esc_html($row['request_uuid']); ?></code></td><td><span class="heiq-badge heiq-badge-<?php echo esc_attr(sanitize_html_class($status)); ?>"><?php echo esc_html(isset($status_labels[$status]) ? $status_labels[$status] : $status); ?></span></td><td><?php echo intval($row['total_files']); ?></td><td><?php echo intval($row['accepted_files']); ?></td><td><?php echo intval($row['duplicate_files']); ?></td><td><?php echo intval($row['failed_files']); ?></td><td><?php echo esc_html($row['created_at']); ?></td><td><?php if (!empty($row['request_json'])) : ?><button type="button" class="heiq-json-button" data-json="<?php echo esc_attr($row['request_json']); ?>" data-json-title="Request — <?php echo esc_attr($row['request_uuid']); ?>"><i class="bx bx-upload"></i> Xem</button><?php else : ?><span class="heiq-json-empty">—</span><?php endif; ?></td><td><?php if (!empty($row['response_json'])) : ?><button type="button" class="heiq-json-button" data-json="<?php echo esc_attr($row['response_json']); ?>" data-json-title="Response — <?php echo esc_attr($row['request_uuid']); ?>"><i class="bx bx-download"></i> Xem</button><?php else : ?><span class="heiq-json-empty">—</span><?php endif; ?></td><td><?php echo esc_html($row['message']); ?></td></tr>
                 <?php endforeach; ?></tbody></table>
             </div></section>
 
@@ -709,6 +763,15 @@ final class TGS_HEIQ_Plugin
                     </div>
                 </div>
             </div>
+            <div class="modal fade" id="heiq-json-modal" tabindex="-1" aria-labelledby="heiq-json-modal-title" aria-hidden="true">
+                <div class="modal-dialog modal-lg modal-dialog-centered modal-dialog-scrollable">
+                    <div class="modal-content">
+                        <div class="modal-header"><h5 class="modal-title" id="heiq-json-modal-title">Chi tiết API</h5><button type="button" class="btn-close" data-bs-dismiss="modal" aria-label="Đóng"></button></div>
+                        <div class="modal-body"><pre id="heiq-json-modal-body" class="heiq-json-modal-body"></pre></div>
+                        <div class="modal-footer"><button type="button" class="btn btn-secondary" data-bs-dismiss="modal">Đóng</button></div>
+                    </div>
+                </div>
+            </div>
         </div>
         <script>
         (function(){
@@ -731,6 +794,19 @@ final class TGS_HEIQ_Plugin
             setTimeout(refreshTableViewports,300);
             ['input','change'].forEach(function(eventName){document.addEventListener(eventName,function(event){if(event.target.closest&&event.target.closest('.heiq-table-scroll thead')){setTimeout(refreshTableViewports,0);}});});
             document.addEventListener('click',function(event){
+                var jsonButton=event.target.closest('.heiq-json-button');
+                if(jsonButton){
+                    var jsonModalElement=document.getElementById('heiq-json-modal');
+                    var jsonModalTitle=document.getElementById('heiq-json-modal-title');
+                    var jsonModalBody=document.getElementById('heiq-json-modal-body');
+                    if(!jsonModalElement||!jsonModalTitle||!jsonModalBody||typeof bootstrap==='undefined'){return;}
+                    var raw=jsonButton.getAttribute('data-json')||'';
+                    try{raw=JSON.stringify(JSON.parse(raw),null,2);}catch(ignore){}
+                    jsonModalTitle.textContent=jsonButton.getAttribute('data-json-title')||'Chi tiết API';
+                    jsonModalBody.textContent=raw;
+                    bootstrap.Modal.getOrCreateInstance(jsonModalElement).show();
+                    return;
+                }
                 var button=event.target.closest('.heiq-error-more');
                 if(!button){return;}
                 var modalElement=document.getElementById('heiq-error-modal');
@@ -759,7 +835,7 @@ final class TGS_HEIQ_Plugin
                 fetch(testForm.getAttribute('data-endpoint'),{method:'POST',headers:{'X-WP-Nonce':testForm.getAttribute('data-nonce')},body:body,credentials:'same-origin'})
                     .then(function(response){return response.json().catch(function(){return {};}).then(function(payload){if(!response.ok){throw new Error(payload.message||('HTTP '+response.status));}return payload;});})
                     .then(function(payload){
-                        var isRejected=payload.status==='failed';
+                        var isRejected=payload.success===false||payload.status==='failed'||payload.status==='partial';
                         result.className='heiq-test-result '+(isRejected?'is-error':'is-success');
                         title.textContent=isRejected?'API đã ghi log nhưng từ chối file':'Đã gọi API thật và ghi nhận request.';
                         details.textContent='';
