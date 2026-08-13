@@ -5,6 +5,10 @@ Plugin nhận file Excel từ BTauto, xử lý tuần tự và nhập các nghi�
 - `PNK_`: phiếu nhập kho.
 - `PBH_`: phiếu bán hàng.
 - `HTL_`: phiếu hàng trả lại.
+- `PNM_`: phiếu nhập mua.
+- `TNCC_`: phiếu trả nhà cung cấp.
+
+Hai loại `PNM_` và `TNCC_` dùng parser/importer của `tgs_htsoft_mua_import` và ghi vào bộ bảng `_mua` phục vụ phòng mua đối chiếu; không ghi vào `local_ledger` của các website shop. Nếu phiếu mua đã tồn tại theo `Số phiếu + Kho + loại`, dữ liệu mới sẽ ghi đè phiếu cũ giống thao tác trên màn `Nạp dữ liệu mua hàng`.
 
 ## API và kết quả cho BTauto
 
@@ -25,6 +29,8 @@ Response thành công có dạng:
 ```
 
 `success = true` khi file đã xử lý hợp lệ, đã được nhập trước đó hoặc các phiếu chỉ bị bỏ qua. BTauto phải lưu tên file và không gửi lại. Chỉ `failed` và `partial` là lỗi thực sự, trả `success = false`.
+
+Với `PNM_`/`TNCC_`, cả phiếu mới và phiếu được cập nhật đều tính là `imported`. Mã chi nhánh chưa ánh xạ website chỉ là cảnh báo vì dữ liệu vẫn được giữ trong bảng đối chiếu `_mua`.
 
 ## Kiến trúc lưu log
 

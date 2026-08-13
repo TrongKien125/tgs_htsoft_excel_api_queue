@@ -1,8 +1,8 @@
 <?php
 /**
  * Plugin Name: TGS HTsoft Excel API Queue
- * Description: Nhận file XLS/XLSX qua REST API, xếp hàng và tự động nhập PNK/PBH/HTL bằng các plugin nghiệp vụ TGS.
- * Version: 1.7.0
+ * Description: Nhận file XLS/XLSX qua REST API, xếp hàng và tự động nhập PNK/PBH/HTL/PNM/TNCC bằng các plugin nghiệp vụ TGS.
+ * Version: 1.8.0
  * Author: TGS
  */
 
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
 
 final class TGS_HEIQ_Plugin
 {
-    const VERSION = '1.7.0';
+    const VERSION = '1.8.0';
     const DB_VERSION = '1.3.0';
     const DB_OPTION = 'tgs_heiq_db_version';
     const SETTINGS_OPTION = 'tgs_heiq_settings';
@@ -302,7 +302,7 @@ final class TGS_HEIQ_Plugin
                 continue;
             }
             if (!$kind) {
-                $rejected[] = $original_name . ': tên file phải bắt đầu bằng PNK_, PBH_ hoặc HTL_.';
+                $rejected[] = $original_name . ': tên file phải bắt đầu bằng PNK_, PBH_, HTL_, PNM_ hoặc TNCC_.';
                 continue;
             }
             if (!in_array($extension, array('xls', 'xlsx'), true)) {
@@ -510,6 +510,12 @@ final class TGS_HEIQ_Plugin
         if (strpos($upper, 'HTL_') === 0) {
             return 'return';
         }
+        if (strpos($upper, 'PNM_') === 0) {
+            return 'purchase';
+        }
+        if (strpos($upper, 'TNCC_') === 0) {
+            return 'sup_return';
+        }
         return '';
     }
 
@@ -678,7 +684,10 @@ final class TGS_HEIQ_Plugin
             'completed' => 'Hoàn tất', 'partial' => 'Một phần', 'failed' => 'Lỗi',
             'duplicate' => 'Trùng', 'imported' => 'Đã nhập', 'skipped' => 'Bỏ qua',
         );
-        $kind_labels = array('stock_in' => 'Nhập kho', 'sale' => 'Bán hàng', 'return' => 'Hàng trả lại');
+        $kind_labels = array(
+            'stock_in' => 'Nhập kho', 'sale' => 'Bán hàng', 'return' => 'Hàng trả lại',
+            'purchase' => 'Nhập mua', 'sup_return' => 'Trả nhà cung cấp',
+        );
         ?>
         <style>
             .tgs-heiq-page{--heiq-blue:#175cd3;--heiq-border:#e4e7ec;--heiq-text:#101828;--heiq-muted:#667085;color:var(--heiq-text);padding:4px 10px 32px;max-width:100%}
@@ -742,7 +751,7 @@ final class TGS_HEIQ_Plugin
             </div>
 
             <div class="heiq-facts">
-                <div class="heiq-fact"><div class="heiq-fact-label">QUY TẮC TÊN FILE</div><div class="heiq-fact-value"><span class="heiq-prefix">PNK_</span> Nhập kho &nbsp; <span class="heiq-prefix">PBH_</span> Bán hàng &nbsp; <span class="heiq-prefix">HTL_</span> Trả lại</div></div>
+                <div class="heiq-fact"><div class="heiq-fact-label">QUY TẮC TÊN FILE</div><div class="heiq-fact-value"><span class="heiq-prefix">PNK_</span> Nhập kho &nbsp; <span class="heiq-prefix">PBH_</span> Bán hàng &nbsp; <span class="heiq-prefix">HTL_</span> Hàng trả &nbsp; <span class="heiq-prefix">PNM_</span> Nhập mua &nbsp; <span class="heiq-prefix">TNCC_</span> Trả NCC</div></div>
                 <div class="heiq-fact"><div class="heiq-fact-label">GIỚI HẠN MỖI FILE</div><div class="heiq-fact-value"><?php echo esc_html(size_format(self::effective_upload_limit())); ?> <span style="font-weight:400;color:#667085">(.xls / .xlsx)</span></div></div>
                 <div class="heiq-fact"><div class="heiq-fact-label">WORKSHEET</div><div class="heiq-fact-value">Luôn đọc sheet đầu tiên</div></div>
             </div>
@@ -889,6 +898,9 @@ final class TGS_HEIQ_Plugin
         }
         if (!class_exists('TGS_HSI_Excel_Parser') || !class_exists('TGS_HSI_Voucher_Creator')) {
             $missing[] = 'tgs_htsoft_sales_import';
+        }
+        if (!class_exists('TGS_HMI_Parser') || !class_exists('TGS_HMI_Importer') || !class_exists('TGS_HMI_DB')) {
+            $missing[] = 'tgs_htsoft_mua_import';
         }
         if ($missing) {
             echo '<div class="notice notice-error"><p><strong>TGS Excel API Queue:</strong> cần kích hoạt ' . esc_html(implode(', ', $missing)) . '.</p></div>';

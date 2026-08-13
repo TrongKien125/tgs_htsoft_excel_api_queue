@@ -103,7 +103,7 @@ class TGS_HEIQ_Queue_Processor
         self::$active_file = $file;
 
         try {
-            self::assert_dependencies($actor_id);
+            self::assert_dependencies($actor_id, $file['kind']);
             wp_set_current_user($actor_id);
             self::assert_legacy_xls_memory_safe($file);
             $excel = TGS_HEIQ_Excel_Reader::read_first_sheet($path, $file['file_name']);
@@ -111,6 +111,8 @@ class TGS_HEIQ_Queue_Processor
 
             if ($file['kind'] === 'stock_in') {
                 $result = self::import_stock_in($excel, $file);
+            } elseif (in_array($file['kind'], array('purchase', 'sup_return'), true)) {
+                $result = self::import_purchase_or_supplier_return($excel, $file, $file['kind']);
             } else {
                 $result = self::import_sale_or_return($excel, $file, $file['kind']);
             }
@@ -266,6 +268,90 @@ class TGS_HEIQ_Queue_Processor
         }
         if ($result['total'] === 0 && $result['skipped'] === 0) {
             throw new Exception('Sheet đầu tiên không có phiếu phù hợp với loại file.');
+        }
+        return self::finalize_result($result);
+    }
+
+    /**
+     * Nạp phiếu mua vào bộ bảng đối chiếu `_mua`. Khác dữ liệu vận hành, phiếu
+     * đã có được cập nhật theo file mới nhất và vẫn là một kết quả thành công.
+     */
+    private static function import_purchase_or_supplier_return(array $excel, array $file, $kind)
+    {
+        global $wpdb;
+        $parser = new TGS_HMI_Parser();
+        $parsed = $parser->parse($excel['rows'], $kind);
+        $vouchers = isset($parsed['vouchers']) && is_array($parsed['vouchers']) ? $parsed['vouchers'] : array();
+        if (!$vouchers) {
+            throw new Exception('Sheet đầu tiên không có phiếu phù hợp với loại file.');
+        }
+
+        $importer = new TGS_HMI_Importer($kind, $file['file_name'], $excel['sheet_name']);
+        $batch_id = $importer->open_batch(
+            intval($parsed['total_rows'] ?? 0),
+            count($vouchers),
+            isset($parsed['unmapped']) && is_array($parsed['unmapped']) ? $parsed['unmapped'] : array()
+        );
+        if ($batch_id <= 0) {
+            throw new Exception('Không tạo được lô nạp dữ liệu mua hàng.');
+        }
+
+        $result = self::empty_result();
+        $result['total'] = count($vouchers);
+        $new = 0;
+        $updated = 0;
+        $voucher_label = $kind === 'sup_return' ? 'phiếu trả nhà cung cấp' : 'phiếu nhập mua';
+
+        foreach ($vouchers as $voucher) {
+            $voucher_code = (string) ($voucher['voucher_code'] ?? '');
+            $zone_code = (string) ($voucher['zone_code'] ?? $voucher['site_code'] ?? '');
+            try {
+                if ($wpdb->query('START TRANSACTION') === false) {
+                    throw new Exception('Không mở được transaction cho phiếu mua.');
+                }
+                $saved = $importer->save($voucher, $batch_id);
+                $ledger_id = intval($saved['ledger_id'] ?? 0);
+                $expected_items = count(isset($voucher['items']) && is_array($voucher['items']) ? $voucher['items'] : array());
+                $stored_items = $ledger_id > 0 ? intval($wpdb->get_var($wpdb->prepare(
+                    'SELECT COUNT(*) FROM ' . TGS_HMI_DB::table_item() . ' WHERE ledger_id = %d',
+                    $ledger_id
+                ))) : 0;
+                if ($ledger_id <= 0 || $stored_items !== $expected_items) {
+                    throw new Exception(sprintf(
+                        'Ghi thiếu dòng hàng (%d/%d), đã hoàn tác phiếu.',
+                        $stored_items,
+                        $expected_items
+                    ));
+                }
+                if ($wpdb->query('COMMIT') === false) {
+                    throw new Exception('Không commit được dữ liệu phiếu mua.');
+                }
+                $is_new = !empty($saved['is_new']);
+                $is_new ? $new++ : $updated++;
+                $result['imported']++;
+                foreach ((array) ($saved['warnings'] ?? array()) as $warning) {
+                    $result['warnings'][] = $voucher_code . ': ' . $warning;
+                }
+                self::log_voucher(
+                    $file,
+                    $voucher_code,
+                    $zone_code,
+                    'imported',
+                    $is_new
+                        ? 'Đã nạp ' . $voucher_label . ' mới vào dữ liệu đối chiếu.'
+                        : 'Đã cập nhật ' . $voucher_label . ' theo file mới nhất.'
+                );
+            } catch (Throwable $e) {
+                $wpdb->query('ROLLBACK');
+                $result['failed']++;
+                $result['errors'][] = $voucher_code . ': ' . $e->getMessage();
+                self::log_voucher($file, $voucher_code, $zone_code, 'failed', $e->getMessage());
+            }
+        }
+
+        $importer->close_batch($batch_id, $new, $updated);
+        if (!empty($parsed['unmapped'])) {
+            $result['warnings'][] = 'Có mã chi nhánh chưa khớp website; dữ liệu vẫn được lưu để đối chiếu.';
         }
         return self::finalize_result($result);
     }
@@ -500,15 +586,18 @@ class TGS_HEIQ_Queue_Processor
         return $result;
     }
 
-    private static function assert_dependencies($actor_id)
+    private static function assert_dependencies($actor_id, $kind)
     {
-        $required = array(
-            'TGS_IT_Excel_Parser', 'TGS_IT_Voucher_Creator',
-            'TGS_HSI_Excel_Parser', 'TGS_HSI_Voucher_Creator', 'TGS_HSI_Money',
-        );
+        if ($kind === 'stock_in') {
+            $required = array('TGS_IT_Excel_Parser', 'TGS_IT_Voucher_Creator');
+        } elseif (in_array($kind, array('purchase', 'sup_return'), true)) {
+            $required = array('TGS_HMI_DB', 'TGS_HMI_Parser', 'TGS_HMI_Money', 'TGS_HMI_Importer');
+        } else {
+            $required = array('TGS_HSI_Excel_Parser', 'TGS_HSI_Voucher_Creator', 'TGS_HSI_Money');
+        }
         foreach ($required as $class) {
             if (!class_exists($class)) {
-                throw new Exception('Thiếu dependency: ' . $class . '. Hãy kích hoạt hai plugin nghiệp vụ.');
+                throw new Exception('Thiếu dependency: ' . $class . '. Hãy kích hoạt plugin nghiệp vụ tương ứng.');
             }
         }
         if (!class_exists('TGS_Money')) {
@@ -520,8 +609,14 @@ class TGS_HEIQ_Queue_Processor
         if (!class_exists('TGS_Money')) {
             throw new Exception('Thiếu TGS_Money từ tgs_shop_management.');
         }
-        if (class_exists('TGS_HSI_DB')) {
+        if (in_array($kind, array('sale', 'return'), true) && class_exists('TGS_HSI_DB')) {
             TGS_HSI_DB::maybe_install();
+        }
+        if (in_array($kind, array('purchase', 'sup_return'), true)) {
+            TGS_HMI_DB::maybe_install();
+            if (!TGS_HMI_Money::ensure()) {
+                throw new Exception('Không khởi tạo được lớp tính tiền cho dữ liệu mua hàng.');
+            }
         }
         if ($actor_id <= 0 || !get_userdata($actor_id) || !user_can($actor_id, 'manage_options')) {
             throw new Exception('Tài khoản chạy worker chưa được cấu hình hoặc không còn quyền manage_options.');
