@@ -672,7 +672,7 @@ final class TGS_HEIQ_Plugin
         $daily_log = TGS_HEIQ_Daily_Log::read_date($selected_log_date);
         $requests = array_slice($daily_log['requests'], 0, 50);
         $files = array_slice($daily_log['files'], 0, 100);
-        $voucher_logs = array_slice($daily_log['vouchers'], 0, 300);
+        $voucher_logs = $daily_log['vouchers'];
         $log_error = TGS_HEIQ_Daily_Log::last_error();
         $endpoint = rest_url(self::REST_NAMESPACE . self::REST_ROUTE);
         $test_endpoint = rest_url(self::REST_NAMESPACE . self::REST_ADMIN_SUBMIT_ROUTE);
@@ -783,7 +783,7 @@ final class TGS_HEIQ_Plugin
                 <?php endforeach; ?></tbody></table>
             </div></section>
 
-            <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><div><h2>Nhật ký phiếu trong ngày</h2><span>Chi tiết từng phiếu đã nhập, bị trùng, bị bỏ qua hoặc xử lý lỗi.</span></div><div class="heiq-table-actions"><span>Tối đa 300 dòng</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-voucher-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-voucher-scroll" class="heiq-table-scroll" data-visible-rows="10">
+            <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><div><h2>Nhật ký phiếu trong ngày</h2><span>Chi tiết từng phiếu đã nhập, bị trùng, bị bỏ qua hoặc xử lý lỗi.</span></div><div class="heiq-table-actions"><span>Toàn bộ <?php echo esc_html(number_format_i18n(count($voucher_logs))); ?> dòng</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-voucher-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-voucher-scroll" class="heiq-table-scroll" data-visible-rows="10">
                 <table class="widefat striped"><thead><tr><th>ID</th><th>Thời gian</th><th>File</th><th>Mã phiếu</th><th>Kho</th><th>Nghiệp vụ</th><th>Trạng thái</th><th>Lý do / kết quả</th></tr></thead><tbody>
                 <?php if (!$voucher_logs) : ?><tr><td class="heiq-empty" colspan="8">Không có nhật ký phiếu trong ngày đã chọn.</td></tr><?php endif; ?>
                 <?php foreach ($voucher_logs as $row) : $status = (string) $row['status']; $kind = (string) $row['kind']; ?>
