@@ -90,9 +90,10 @@ final class TGS_HEIQ_Daily_Log
         }
     }
 
-    public static function read_date($date)
+    public static function read_date($date, $record_limit = 0)
     {
         $date = self::normalize_date($date);
+        $record_limit = max(0, intval($record_limit));
         $result = array('date' => $date, 'requests' => array(), 'files' => array(), 'vouchers' => array());
         $path = self::file_path($date, false);
         if (!$path || !is_file($path) || !is_readable($path)) {
@@ -104,9 +105,23 @@ final class TGS_HEIQ_Daily_Log
             return $result;
         }
         $records = array();
+        $record_lines = array();
         while (($line = fgets($handle)) !== false) {
             $line = trim($line);
             if ($line === '' || strpos($line, '<?php') === 0) {
+                continue;
+            }
+            if ($record_limit > 0) {
+                if (!preg_match('/"request_uuid":"([^"]+)"/', $line, $matches)) {
+                    continue;
+                }
+                $request_uuid = (string) $matches[1];
+                // Gán lại ở cuối để bản duplicate mới nhất được giữ lại đúng thứ tự.
+                unset($record_lines[$request_uuid]);
+                $record_lines[$request_uuid] = $line;
+                while (count($record_lines) > $record_limit) {
+                    array_shift($record_lines);
+                }
                 continue;
             }
             $record = json_decode($line, true);
@@ -118,6 +133,16 @@ final class TGS_HEIQ_Daily_Log
             $records[(string) $record['request_uuid']] = $record;
         }
         fclose($handle);
+
+        // File log có thể rất lớn. Với màn quản trị, chỉ JSON-decode số record
+        // cuối được yêu cầu thay vì giải mã toàn bộ ngày rồi mới array_slice().
+        foreach ($record_lines as $line) {
+            $record = json_decode($line, true);
+            if (!is_array($record) || empty($record['request_uuid'])) {
+                continue;
+            }
+            $records[(string) $record['request_uuid']] = $record;
+        }
 
         foreach ($records as $record) {
             $request = isset($record['request']) && is_array($record['request']) ? $record['request'] : array();

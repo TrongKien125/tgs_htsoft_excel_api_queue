@@ -2,7 +2,7 @@
 /**
  * Plugin Name: TGS HTsoft Excel API Queue
  * Description: Nhận file XLS/XLSX qua REST API, xếp hàng và tự động nhập PNK/PBH/HTL/PNM/TNCC bằng các plugin nghiệp vụ TGS.
- * Version: 1.8.0
+ * Version: 1.8.1
  * Author: TGS
  */
 
@@ -12,7 +12,7 @@ if (!defined('ABSPATH')) {
 
 final class TGS_HEIQ_Plugin
 {
-    const VERSION = '1.8.0';
+    const VERSION = '1.8.1';
     const DB_VERSION = '1.3.0';
     const DB_OPTION = 'tgs_heiq_db_version';
     const SETTINGS_OPTION = 'tgs_heiq_settings';
@@ -23,6 +23,9 @@ final class TGS_HEIQ_Plugin
     const REST_ADMIN_SUBMIT_ROUTE = '/admin-submit';
     const DASHBOARD_VIEW = 'htsoft-excel-api-queue';
     const MAX_FILE_BYTES = 10485760;
+    const DASHBOARD_REQUEST_LIMIT = 50;
+    const DASHBOARD_FILE_LIMIT = 100;
+    const DASHBOARD_VOUCHER_LIMIT = 1000;
 
     private static $instance;
 
@@ -45,7 +48,7 @@ final class TGS_HEIQ_Plugin
         add_action('rest_api_init', array($this, 'register_rest_route'));
         add_action('init', array($this, 'maybe_install'));
         add_action('init', array($this, 'remove_legacy_schedule'), 1);
-        add_action('init', array('TGS_HEIQ_Daily_Log', 'recover_pending'), 30);
+        add_action('init', array($this, 'maybe_recover_pending_logs'), 30);
         add_action('admin_post_tgs_heiq_generate_key', array($this, 'generate_api_key'));
         add_action('admin_notices', array($this, 'dependency_notice'));
         add_filter('tgs_shop_workflow_nav', array($this, 'add_to_workflow_nav'), 10, 2);
@@ -101,6 +104,18 @@ final class TGS_HEIQ_Plugin
         if (get_site_option(self::DB_OPTION) !== self::DB_VERSION) {
             self::install_schema();
         }
+    }
+
+    public function maybe_recover_pending_logs()
+    {
+        $is_log_date_navigation = is_admin()
+            && isset($_GET['page'], $_GET['view'], $_GET['heiq_log_date'])
+            && sanitize_key(wp_unslash($_GET['page'])) === 'tgs-shop-management'
+            && sanitize_key(wp_unslash($_GET['view'])) === self::DASHBOARD_VIEW;
+        if ($is_log_date_navigation) {
+            return;
+        }
+        TGS_HEIQ_Daily_Log::recover_pending();
     }
 
     private static function install_schema()
@@ -665,14 +680,14 @@ final class TGS_HEIQ_Plugin
         if ($new_key) {
             delete_transient('tgs_heiq_new_key_' . get_current_user_id());
         }
-        TGS_HEIQ_Daily_Log::recover_pending();
         $selected_log_date = TGS_HEIQ_Daily_Log::selected_date(
             isset($_GET['heiq_log_date']) ? sanitize_text_field(wp_unslash($_GET['heiq_log_date'])) : ''
         );
-        $daily_log = TGS_HEIQ_Daily_Log::read_date($selected_log_date);
-        $requests = array_slice($daily_log['requests'], 0, 50);
-        $files = array_slice($daily_log['files'], 0, 100);
-        $voucher_logs = $daily_log['vouchers'];
+        $daily_log = TGS_HEIQ_Daily_Log::read_date($selected_log_date, self::DASHBOARD_REQUEST_LIMIT);
+        $requests = array_slice($daily_log['requests'], 0, self::DASHBOARD_REQUEST_LIMIT);
+        $files = array_slice($daily_log['files'], 0, self::DASHBOARD_FILE_LIMIT);
+        $voucher_log_total = count($daily_log['vouchers']);
+        $voucher_logs = array_slice($daily_log['vouchers'], 0, self::DASHBOARD_VOUCHER_LIMIT);
         $log_error = TGS_HEIQ_Daily_Log::last_error();
         $endpoint = rest_url(self::REST_NAMESPACE . self::REST_ROUTE);
         $test_endpoint = rest_url(self::REST_NAMESPACE . self::REST_ADMIN_SUBMIT_ROUTE);
@@ -783,7 +798,7 @@ final class TGS_HEIQ_Plugin
                 <?php endforeach; ?></tbody></table>
             </div></section>
 
-            <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><div><h2>Nhật ký phiếu trong ngày</h2><span>Chi tiết từng phiếu đã nhập, bị trùng, bị bỏ qua hoặc xử lý lỗi.</span></div><div class="heiq-table-actions"><span>Toàn bộ <?php echo esc_html(number_format_i18n(count($voucher_logs))); ?> dòng</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-voucher-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-voucher-scroll" class="heiq-table-scroll" data-visible-rows="10">
+            <section class="heiq-card heiq-table-card"><div class="heiq-table-heading"><div><h2>Nhật ký phiếu trong ngày</h2><span>Chi tiết từng phiếu thuộc tối đa <?php echo esc_html(number_format_i18n(self::DASHBOARD_REQUEST_LIMIT)); ?> request mới nhất.</span></div><div class="heiq-table-actions"><span><?php echo $voucher_log_total > count($voucher_logs) ? 'Hiển thị ' . esc_html(number_format_i18n(count($voucher_logs))) . ' / ' . esc_html(number_format_i18n($voucher_log_total)) : 'Toàn bộ ' . esc_html(number_format_i18n($voucher_log_total)); ?> dòng</span><label class="heiq-row-limit-label">Hiển thị <select class="heiq-row-limit" data-scroll-target="heiq-voucher-scroll"><option value="10" selected>10</option><option value="20">20</option><option value="50">50</option><option value="100">100</option></select> dòng</label></div></div><div id="heiq-voucher-scroll" class="heiq-table-scroll" data-visible-rows="10">
                 <table class="widefat striped"><thead><tr><th>ID</th><th>Thời gian</th><th>File</th><th>Mã phiếu</th><th>Kho</th><th>Nghiệp vụ</th><th>Trạng thái</th><th>Lý do / kết quả</th></tr></thead><tbody>
                 <?php if (!$voucher_logs) : ?><tr><td class="heiq-empty" colspan="8">Không có nhật ký phiếu trong ngày đã chọn.</td></tr><?php endif; ?>
                 <?php foreach ($voucher_logs as $row) : $status = (string) $row['status']; $kind = (string) $row['kind']; ?>
